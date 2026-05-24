@@ -1,0 +1,108 @@
+# Trading platform — local stack.
+#
+# Three services: TimescaleDB (data), platform (Python research/live container),
+# Grafana (dashboards). Versions are pinned deliberately — bump them on purpose,
+# not by accident. Re-pin to whatever is current when you reinstall.
+
+services:
+  timescaledb:
+    # Pinned. Do NOT use :latest — research reproducibility depends on the DB
+    # behaving the same after a reinstall. Bump intentionally.
+    image: timescale/timescaledb:2.17.2-pg16
+    container_name: tp-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trading
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      # schema.sql runs ONCE, only when the volume is first initialized.
+      # Adding columns later requires migrations or wiping the volume.
+      - ./data/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d trading"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  admin:
+    # Streamlit-based admin dashboard. Read+write companion to the read-only
+    # Grafana dashboard. Reuses the platform image (same Dockerfile + reqs).
+    build: ./platform
+    container_name: tp-admin
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      DB_NAME: trading
+      DB_USER: trader
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      ALPACA_BASE_URL: https://paper-api.alpaca.markets
+      # Pass the runner config through so the sidebar can show its state.
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./platform:/app
+      - ./data:/app/data
+    # Streamlit defaults: port 8501, listens 0.0.0.0 so the host port maps.
+    # --server.headless=true skips the "open browser" prompt.
+    # --browser.gatherUsageStats=false: don't phone home.
+    command: ["streamlit", "run", "/app/admin.py",
+              "--server.address=0.0.0.0",
+              "--server.port=8501",
+              "--server.headless=true",
+              "--browser.gatherUsageStats=false"]
+
+  sr-bot:
+    # Standalone S&R paper trading bot. Reuses the platform image (same
+    # Python + alpaca-py + psycopg2 + pandas). Talks directly to Alpaca,
+    # writes trades into the shared TimescaleDB so the admin S&R Bot
+    # page surfaces them.
+    build: ./platform
+    container_name: tp-sr-bot
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      DB_NAME: trading
+      DB_USER: trader
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      SR_BOT_ENABLED: ${SR_BOT_ENABLED:-true}
+      SR_BOT_SYMBOLS: ${SR_BOT_SYMBOLS:-BTC/USD,ETH/USD,SOL/USD,LINK/USD,AVAX/USD,DOGE/USD,AAVE/USD}
+      SR_BOT_EQUITIES: ${SR_BOT_EQUITIES:-DIA,SPY,QQQ}
+      NOTIONAL_PER_TRADE: ${SR_BOT_NOTIONAL:-250}
+      APPROACH_PCT: ${SR_BOT_APPROACH_PCT:-0.003}
+      USE_SCRAPEMCP_SENTIMENT: ${USE_SCRAPEMCP_SENTIMENT:-false}
+      SCRAPEMCP_URL: ${SCRAPEMCP_URL:-http://host.docker.internal:8000}
+      SCRAPEMCP_TOKEN: ${SCRAPEMCP_TOKEN:-}
+    volumes:
+      - ./platform/sr-bot:/app/sr-bot
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["bash", "-lc",
+              "if [ \"$$SR_BOT_ENABLED\" = \"true\" ]; then \
+                 cd /app/sr-bot && python sr_paper_bot.py; \
+               else \
+                 echo 'sr-bot disabled (SR_BOT_ENABLED!=true). Sleeping.'; \
+                 sleep infinity; \
+               fi"]
+
+volumes:
+  timescale_data:
