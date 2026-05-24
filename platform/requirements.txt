@@ -19,6 +19,9 @@ vectorbt==0.26.2
 scipy==1.13.1
 statsmodels==0.14.2
 
+# Phase 8: meta-classifier (RandomForest on entry features)
+scikit-learn==1.5.0
+
 # Live + utilities (chunk 5)
 requests==2.32.3
 schedule==1.2.2

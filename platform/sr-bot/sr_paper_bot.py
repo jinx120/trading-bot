@@ -72,7 +72,74 @@ DEFAULTS = {
     "MAX_HOLD_HOURS": 24,                 # force-close after this many hours
     "REFLECTION_EVERY_TICKS": 360,        # auto-run reflection every N ticks (~6h at 60s)
     "ENV_RELOAD_EVERY_TICKS": 5,          # re-read .env every N ticks for hot config
+    # --- Phase 7: CUSUM event-driven evaluation ---
+    # Skip per-symbol signal generation unless cumulative log-return since
+    # last evaluation exceeds CUSUM_K * symbol_sigma. Safety net at
+    # CUSUM_MAX_SKIP_SECONDS — guarantees evaluation at least that often
+    # even in dead-quiet markets.
+    "CUSUM_ENABLED": True,
+    "CUSUM_K": 1.5,                        # std-dev multiplier
+    "CUSUM_LOOKBACK_BARS": 48,             # bars to estimate sigma over
+    "CUSUM_MAX_SKIP_SECONDS": 600,         # force eval after this long
 }
+
+
+# Module-level CUSUM state, keyed by symbol. Persists across ticks within
+# the process; resets on bot restart. Each entry:
+#   {"last_eval_price": float, "cumsum": float, "last_eval_ts": datetime}
+_CUSUM_STATE: dict[str, dict] = {}
+
+
+def _cusum_should_eval(symbol: str, current_price: float, bars: pd.DataFrame,
+                       cfg: dict, now: datetime) -> tuple[bool, str]:
+    """Return (should_eval, reason). Maintains _CUSUM_STATE internally."""
+    if not cfg.get("CUSUM_ENABLED", True):
+        return True, "disabled"
+    state = _CUSUM_STATE.get(symbol)
+    if state is None or state.get("last_eval_price") is None:
+        # First time we see this symbol — eval now, seed state.
+        _CUSUM_STATE[symbol] = {
+            "last_eval_price": current_price,
+            "cumsum": 0.0,
+            "last_eval_ts": now,
+        }
+        return True, "first"
+
+    # Time-based safety net
+    elapsed = (now - state["last_eval_ts"]).total_seconds()
+    if elapsed >= float(cfg.get("CUSUM_MAX_SKIP_SECONDS", 600)):
+        state["last_eval_price"] = current_price
+        state["cumsum"] = 0.0
+        state["last_eval_ts"] = now
+        return True, f"timeout {elapsed:.0f}s"
+
+    # Sigma estimate from recent bar returns
+    if len(bars) < int(cfg.get("CUSUM_LOOKBACK_BARS", 48)):
+        # not enough data to estimate, evaluate
+        state["last_eval_price"] = current_price
+        state["cumsum"] = 0.0
+        state["last_eval_ts"] = now
+        return True, "no_sigma"
+    closes = bars["close"].tail(int(cfg["CUSUM_LOOKBACK_BARS"]))
+    log_rets = np.log(closes / closes.shift(1)).dropna()
+    sigma = float(log_rets.std())
+    if sigma <= 0 or np.isnan(sigma):
+        return True, "zero_sigma"
+
+    # Update cumsum
+    log_ret = float(np.log(current_price / state["last_eval_price"]))
+    state["cumsum"] = log_ret  # last-eval-anchored, not running sum
+
+    k = float(cfg.get("CUSUM_K", 1.5))
+    if abs(state["cumsum"]) >= k * sigma:
+        magnitude = abs(state["cumsum"]) / sigma
+        # Trigger fired — reset baseline
+        state["last_eval_price"] = current_price
+        state["cumsum"] = 0.0
+        state["last_eval_ts"] = now
+        return True, f"cusum {magnitude:.2f}σ"
+
+    return False, f"under {abs(state['cumsum']) / sigma:.2f}σ"
 
 
 def _env(name: str, default):
@@ -88,7 +155,10 @@ def _env(name: str, default):
     return raw
 
 
-def load_env_file(path: str) -> None:
+def load_env_file(path: str, overwrite: bool = False) -> None:
+    """Read a .env file into os.environ. overwrite=True makes .env win over
+    pre-existing container env vars, so the Symbols-page edits take effect
+    even at bot startup (not just after the hot-reload cycle)."""
     if not os.path.exists(path):
         return
     with open(path) as f:
@@ -97,7 +167,10 @@ def load_env_file(path: str) -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            key = k.strip()
+            val = v.strip()
+            if overwrite or key not in os.environ:
+                os.environ[key] = val
 
 
 # ---------------------------------------------------------------------------
@@ -843,6 +916,20 @@ def tick(alpaca: Alpaca, cfg: dict, dry_run: bool = False) -> None:
             live_px = None
         bar_close = float(bars["close"].iloc[-1])
 
+        # ----- Phase 7: CUSUM event-driven gate -----
+        # Skip the heavy signal/ensemble work when the symbol hasn't moved
+        # meaningfully since its last evaluation. Saves API calls + DB writes
+        # and avoids re-evaluating noise. Set CUSUM_LOG_SKIPS=true in .env
+        # for visible skip logs during tuning.
+        cusum_px = float(live_px) if live_px is not None else bar_close
+        should_eval, cusum_reason = _cusum_should_eval(symbol, cusum_px, bars, cfg, end)
+        if not should_eval:
+            if os.environ.get("CUSUM_LOG_SKIPS", "false").lower() == "true":
+                logging.info("%s: CUSUM skip (%s)", symbol, cusum_reason)
+            else:
+                logging.debug("%s: CUSUM skip (%s)", symbol, cusum_reason)
+            continue
+
         # ----- Ensemble path (Phase 4) -----
         if ensemble_mode and ensemble_scores:
             from ensemble import decide, derive_sl_tp
@@ -864,6 +951,52 @@ def tick(alpaca: Alpaca, cfg: dict, dry_run: bool = False) -> None:
                 log_signal(symbol, None, bar_close, took_trade=False,
                            skip_reason=f"ensemble:{decision.reason}", extras=extras)
                 continue
+
+            # Alpaca paper doesn't support crypto shorts. Skip those entirely
+            # rather than spam rejected orders. (Equities can short with margin.)
+            if is_crypto and decision.side == "sell":
+                logging.info("%s: SHORT signal but crypto can't short on Alpaca — skip",
+                             symbol)
+                log_signal(symbol, None, bar_close, took_trade=False,
+                           skip_reason="crypto_no_short",
+                           extras={**extras, "would_have_side": "sell"})
+                continue
+
+            # ---- Phase 8: meta-classifier veto ----
+            # P(TP_HIT before SL_HIT) from a RandomForest trained on prior
+            # closed trades. Returns None when undertrained (proceeds w/o veto).
+            try:
+                from meta_classifier import build_features, should_veto
+                feats = build_features(
+                    ensemble_breakdown=decision.breakdown,
+                    composite=decision.composite,
+                    confidence=decision.confidence,
+                    regime_label="unknown",  # filled below if SR signal exists
+                    adx=0.0, atr_pct=0.0, sma_dev_pct=0.0,
+                    ts=end,
+                )
+                if sr_sig:
+                    snap = sr_sig.snapshot
+                    feats = build_features(
+                        ensemble_breakdown=decision.breakdown,
+                        composite=decision.composite,
+                        confidence=decision.confidence,
+                        regime_label=snap.get("regime", "unknown"),
+                        adx=snap.get("adx", 0) or 0.0,
+                        atr_pct=0.0,
+                        sma_dev_pct=snap.get("sma_dev_pct", 0) or 0.0,
+                        ts=end,
+                    )
+                veto_meta, p_tp, meta_reason = should_veto(feats)
+                extras["meta_p_tp"] = p_tp
+                extras["meta_reason"] = meta_reason
+                if veto_meta:
+                    logging.warning("%s: META-VETO — %s", symbol, meta_reason)
+                    log_signal(symbol, None, bar_close, took_trade=False,
+                               skip_reason=f"meta_veto:{meta_reason}", extras=extras)
+                    continue
+            except Exception as e:
+                logging.debug("meta-classifier check failed (proceeding): %s", e)
 
             # Need SR levels for SL/TP derivation if SR is dominant
             sr_sig = generate_signal(symbol, bars, cfg, live_price=live_px)
@@ -995,9 +1128,11 @@ def main():
     parser.add_argument("--env", default="/home/redji/sr-bot/.env")
     args = parser.parse_args()
 
-    load_env_file(args.env)
-    # also fall back to trading-platform .env for db creds & alpaca keys
-    load_env_file("/home/redji/trading-platform/.env")
+    # Primary .env: SR_BOT_* user config (Symbols page writes here).
+    # Overwrite=True so this beats any docker-compose-injected defaults.
+    load_env_file(args.env, overwrite=True)
+    # Fallback for DB creds & Alpaca keys; don't overwrite container values.
+    load_env_file("/home/redji/trading-platform/.env", overwrite=False)
     setup_logging()
 
     cfg = {k: _env(k, v) for k, v in DEFAULTS.items()}

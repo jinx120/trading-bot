@@ -537,6 +537,20 @@ def main() -> dict:
                        "; ".join(f"{k.upper()} — {frozen[k.upper()]}" for k in dropped)
             log.info("anti-runaway dropped %d proposed changes: %s", len(dropped), dropped)
 
+    # Phase-8: retrain meta-classifier on the latest closed trades.
+    if os.environ.get("META_ENABLED", "true").lower() == "true":
+        try:
+            from meta_classifier import train as meta_train
+            meta_result = meta_train()
+            summary += "\nMETA_CLASSIFIER: " + json.dumps({
+                k: round(v, 4) if isinstance(v, float) else v
+                for k, v in meta_result.items()
+                if k in ("ok", "reason", "n_samples", "val_auc")
+            })
+        except Exception as e:
+            log.warning("meta-classifier train failed: %s", e)
+            summary += f"\nMETA_CLASSIFIER: ERROR — {e}"
+
     # Phase-6 retirement gate: disable sub-strategies with persistently
     # negative hit rate; re-enable ones that have recovered. Runs every
     # reflection cycle, regardless of whether a param proposal exists.

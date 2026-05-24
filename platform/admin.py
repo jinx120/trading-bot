@@ -41,7 +41,7 @@ def engine():
 # ---------------------------------------------------------------------------
 st.sidebar.title("Trading Bot")
 st.sidebar.caption(f"UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
-page = st.sidebar.radio("Page", ["Bot", "Reflections", "Ingest"])
+page = st.sidebar.radio("Page", ["Bot", "Symbols", "Reflections"])
 
 _alpaca_ok = bool(os.environ.get("ALPACA_API_KEY"))
 if _alpaca_ok:
@@ -346,60 +346,194 @@ elif page == "Reflections":
 
 
 # ---------------------------------------------------------------------------
-# Page: Ingest
+# Page: Symbols — flashy GUI for managing the bot's trading universe
 # ---------------------------------------------------------------------------
-elif page == "Ingest":
-    st.title("Ingest historical bars")
+elif page == "Symbols":
+    st.title("🎯 Symbols")
     st.caption(
-        "Pull historical OHLCV from Alpaca for reflection backtests. "
-        "The bot itself pulls live data directly from Alpaca and does not "
-        "need this table — but reflection does, to replay decisions."
+        "What the bot watches and trades. Toggle a symbol off and it stops "
+        "considering new entries for that ticker. Bot picks up changes within "
+        "5 ticks (hot-reload). Existing positions are NOT auto-closed when "
+        "you disable — they exit on their own SL/TP/trail."
     )
 
-    syms = st.text_input("Symbols (comma-separated)",
-                         value="BTC/USD,ETH/USD,SOL/USD,LINK/USD,AVAX/USD,DOGE/USD,AAVE/USD")
-    c1, c2 = st.columns(2)
-    timeframe = c1.selectbox("Timeframe", ["1hour", "1day", "15min"])
-    is_crypto = c2.checkbox("Crypto endpoint", value=True,
-                            help="Use crypto feed for BTC/USD etc. Uncheck for SPY/QQQ/DIA.")
-    years = st.number_input("Years", min_value=1, max_value=10, value=2)
+    ENV_PATH = "/app/sr-bot/.env"
+    BOT_ENV_PATH_HOST = "/home/redji/sr-bot/.env"
 
-    if st.button("▶ Start ingestion", type="primary"):
-        chosen = [s.strip() for s in syms.split(",") if s.strip()]
-        if not chosen:
-            st.error("No symbols.")
+    def _read_env() -> dict:
+        env = {}
+        if os.path.exists(ENV_PATH):
+            for line in open(ENV_PATH):
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip()
+        return env
+
+    def _write_env_key(key: str, value: str) -> None:
+        for path in (ENV_PATH, BOT_ENV_PATH_HOST):
+            if not os.path.exists(path):
+                continue
+            try:
+                lines = open(path).read().splitlines()
+                replaced = False
+                for i, ln in enumerate(lines):
+                    if ln.startswith(f"{key}="):
+                        lines[i] = f"{key}={value}"
+                        replaced = True
+                        break
+                if not replaced:
+                    lines.append(f"{key}={value}")
+                with open(path, "w") as f:
+                    f.write("\n".join(lines) + "\n")
+            except Exception as e:
+                st.error(f"writing {path}: {e}")
+
+    _env = _read_env()
+    active_crypto = [s.strip() for s in _env.get(
+        "SR_BOT_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,LINK/USD,AVAX/USD,DOGE/USD,AAVE/USD"
+    ).split(",") if s.strip()]
+    active_equity = [s.strip() for s in _env.get(
+        "SR_BOT_EQUITIES", "DIA,SPY,QQQ"
+    ).split(",") if s.strip()]
+
+    # Build a pool of "known" symbols = currently active plus a curated list
+    # so the user can quickly toggle popular tickers on/off.
+    CRYPTO_POOL = sorted(set(active_crypto) | {
+        "BTC/USD", "ETH/USD", "SOL/USD", "LINK/USD", "AVAX/USD",
+        "DOGE/USD", "AAVE/USD", "ADA/USD", "DOT/USD", "MATIC/USD",
+        "UNI/USD", "XRP/USD", "LTC/USD", "BCH/USD",
+    })
+    EQUITY_POOL = sorted(set(active_equity) | {
+        "DIA", "SPY", "QQQ", "IWM", "TQQQ", "SOXL", "TLT",
+        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
+    })
+
+    # ---- Pull live prices (cached for 15s to avoid per-render Alpaca calls) ----
+    @st.cache_data(ttl=15, show_spinner=False)
+    def _fetch_prices(crypto_csv: str, equity_csv: str) -> tuple[dict, dict]:
+        headers = {
+            "APCA-API-KEY-ID": os.environ.get("ALPACA_API_KEY", ""),
+            "APCA-API-SECRET-KEY": os.environ.get("ALPACA_API_SECRET", ""),
+        }
+        cp, ep = {}, {}
+        if crypto_csv:
+            try:
+                r = requests.get(
+                    "https://data.alpaca.markets/v1beta3/crypto/us/latest/trades",
+                    params={"symbols": crypto_csv},
+                    headers=headers, timeout=8,
+                )
+                if r.ok:
+                    for sym, t in r.json().get("trades", {}).items():
+                        cp[sym] = {"price": float(t["p"])}
+            except Exception:
+                pass
+        if equity_csv:
+            try:
+                r = requests.get(
+                    "https://data.alpaca.markets/v2/stocks/trades/latest",
+                    params={"symbols": equity_csv, "feed": "iex"},
+                    headers=headers, timeout=8,
+                )
+                if r.ok:
+                    for sym, t in r.json().get("trades", {}).items():
+                        ep[sym] = {"price": float(t["p"])}
+            except Exception:
+                pass
+        return cp, ep
+
+    crypto_prices, equity_prices = _fetch_prices(
+        ",".join(CRYPTO_POOL), ",".join(EQUITY_POOL),
+    )
+
+    # ---- Open positions lookup ----
+    open_by_sym = {p["symbol"]: p for p in alpaca_positions()}
+
+    def render_card_grid(pool: list[str], active: list[str], prices: dict,
+                         label_emoji: str, env_key: str):
+        """Render a grid of toggle cards. Uses st.container for stable layout
+        instead of inline-styled divs (lighter on Streamlit's renderer)."""
+        active_set = set(active)
+        per_row = 4
+        rows = (len(pool) + per_row - 1) // per_row
+        new_active: list[str] = []
+        for r in range(rows):
+            cols = st.columns(per_row)
+            for c in range(per_row):
+                i = r * per_row + c
+                if i >= len(pool):
+                    continue
+                sym = pool[i]
+                px = prices.get(sym, {}).get("price")
+                pos = open_by_sym.get(sym.replace("/", ""))
+                with cols[c]:
+                    # Stable, fixed-width text so font swap doesn't shift layout.
+                    px_str = f"${px:,.4f}" if px is not None else "—".ljust(10)
+                    pos_str = (f"📍 {float(pos['qty']):.4f}" if pos else "")
+                    st.markdown(
+                        f"**{label_emoji} {sym}**  \n"
+                        f"`{px_str}`  \n"
+                        f"<small>{pos_str}</small>",
+                        unsafe_allow_html=True,
+                    )
+                    enabled = st.toggle(
+                        "active" if sym in active_set else "inactive",
+                        value=(sym in active_set),
+                        key=f"toggle_{env_key}_{sym}", label_visibility="collapsed",
+                    )
+                    if enabled:
+                        new_active.append(sym)
+        return new_active
+
+    st.subheader("🪙 Crypto (24/7)")
+    new_crypto = render_card_grid(CRYPTO_POOL, active_crypto, crypto_prices,
+                                  "🪙", "SR_BOT_SYMBOLS")
+    if set(new_crypto) != set(active_crypto):
+        _write_env_key("SR_BOT_SYMBOLS", ",".join(new_crypto))
+        st.success(f"✓ Updated crypto universe ({len(new_crypto)} symbols). "
+                   f"Bot hot-reloads within ~5 minutes.")
+
+    st.divider()
+
+    st.subheader("📈 Equities (US market hours only)")
+    new_equity = render_card_grid(EQUITY_POOL, active_equity, equity_prices,
+                                  "📈", "SR_BOT_EQUITIES")
+    if set(new_equity) != set(active_equity):
+        _write_env_key("SR_BOT_EQUITIES", ",".join(new_equity))
+        st.success(f"✓ Updated equity universe ({len(new_equity)} symbols).")
+
+    st.divider()
+
+    # ---- Add custom symbol ----
+    st.subheader("➕ Add custom symbol")
+    cc1, cc2, cc3 = st.columns([2, 1, 1])
+    with cc1:
+        new_sym = st.text_input(
+            "Symbol (e.g. SHIB/USD for crypto, NVDA for equity)",
+            label_visibility="collapsed",
+            placeholder="SHIB/USD or NVDA",
+            key="add_symbol_input",
+        )
+    asset_class = cc2.selectbox(
+        "Type", ["Crypto", "Equity"], label_visibility="collapsed",
+        key="add_symbol_class",
+    )
+    if cc3.button("➕ Add", type="primary", use_container_width=True):
+        sym = (new_sym or "").strip().upper()
+        if not sym:
+            st.error("Empty symbol.")
+        elif asset_class == "Crypto" and "/" not in sym:
+            st.error("Crypto symbols need a slash, e.g. SHIB/USD")
+        elif asset_class == "Equity" and "/" in sym:
+            st.error("Equity symbols don't have a slash.")
         else:
-            cmd = ["python", "/app/data/ingest_alpaca.py",
-                   "--symbols", ",".join(chosen),
-                   "--timeframe", timeframe,
-                   "--years", str(years)]
-            if is_crypto:
-                cmd.append("--crypto")
-            log_path = f"/tmp/ingest_{int(datetime.now().timestamp())}.log"
-            subprocess.Popen(cmd, stdout=open(log_path, "w"),
-                             stderr=subprocess.STDOUT)
-            st.success(f"Started: `{' '.join(cmd)}`")
-            st.caption(f"Log: {log_path}")
-
-    st.subheader("Recent ingestion activity")
-    with engine().connect() as conn:
-        try:
-            ing = pd.read_sql_query(text("""
-                SELECT ts, source, symbol, timeframe, rows, status,
-                       SUBSTRING(error, 1, 80) AS error
-                FROM ingestion_log ORDER BY ts DESC LIMIT 30
-            """), conn)
-            st.dataframe(ing, use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.warning(f"ingestion_log not available: {e}")
-
-    st.subheader("Bars in DB")
-    with engine().connect() as conn:
-        bars_summary = pd.read_sql_query(text("""
-            SELECT symbol, timeframe, COUNT(*) AS n_bars,
-                   MIN(ts) AS first_ts, MAX(ts) AS last_ts
-            FROM bars
-            GROUP BY symbol, timeframe
-            ORDER BY symbol, timeframe
-        """), conn)
-    st.dataframe(bars_summary, use_container_width=True, hide_index=True)
+            key = "SR_BOT_SYMBOLS" if asset_class == "Crypto" else "SR_BOT_EQUITIES"
+            current = new_crypto if asset_class == "Crypto" else new_equity
+            if sym in current:
+                st.info(f"{sym} already in universe.")
+            else:
+                current.append(sym)
+                _write_env_key(key, ",".join(current))
+                st.success(f"✓ Added {sym}. Bot will pick it up on next reload.")
+                st.rerun()

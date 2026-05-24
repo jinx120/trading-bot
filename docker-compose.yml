@@ -65,6 +65,38 @@ services:
               "--server.headless=true",
               "--browser.gatherUsageStats=false"]
 
+  lab:
+    # The Lab — autonomous research + improvement loop. Runs shadow strategies,
+    # backfills forward returns, evaluates them, auto-promotes winners, and
+    # monitors live bot health. Reads/writes the same TimescaleDB but never
+    # touches live trading state — only DB tables (shadow_scores, lab_events,
+    # strategy_weights when promoting).
+    build: ./platform
+    container_name: tp-lab
+    restart: unless-stopped
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      DB_NAME: trading
+      DB_USER: trader
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      ALPACA_API_KEY: ${ALPACA_API_KEY}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET}
+      LAB_ENABLED: ${LAB_ENABLED:-true}
+    volumes:
+      - ./platform/sr-bot:/app/sr-bot
+    command: ["bash", "-lc",
+              "if [ \"$$LAB_ENABLED\" = \"true\" ]; then \
+                 pip install --quiet scikit-learn==1.5.0 2>&1 | tail -1 ; \
+                 cd /app/sr-bot && python -m lab.lab_runner ; \
+               else \
+                 echo 'lab disabled (LAB_ENABLED!=true). Sleeping.' ; \
+                 sleep infinity ; \
+               fi"]
+
   sr-bot:
     # Standalone S&R paper trading bot. Reuses the platform image (same
     # Python + alpaca-py + psycopg2 + pandas). Talks directly to Alpaca,
@@ -85,10 +117,9 @@ services:
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
       SR_BOT_ENABLED: ${SR_BOT_ENABLED:-true}
-      SR_BOT_SYMBOLS: ${SR_BOT_SYMBOLS:-BTC/USD,ETH/USD,SOL/USD,LINK/USD,AVAX/USD,DOGE/USD,AAVE/USD}
-      SR_BOT_EQUITIES: ${SR_BOT_EQUITIES:-DIA,SPY,QQQ}
-      NOTIONAL_PER_TRADE: ${SR_BOT_NOTIONAL:-250}
-      APPROACH_PCT: ${SR_BOT_APPROACH_PCT:-0.003}
+      # Symbol universe, sizing, and strategy params now live in sr-bot/.env
+      # (editable via the admin Symbols page). docker-compose intentionally
+      # does NOT set them so the .env file is the single source of truth.
       USE_SCRAPEMCP_SENTIMENT: ${USE_SCRAPEMCP_SENTIMENT:-false}
       SCRAPEMCP_URL: ${SCRAPEMCP_URL:-http://host.docker.internal:8000}
       SCRAPEMCP_TOKEN: ${SCRAPEMCP_TOKEN:-}
