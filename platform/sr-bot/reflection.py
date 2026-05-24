@@ -38,8 +38,35 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Defaults
 # ---------------------------------------------------------------------------
 LOOKBACK_DAYS = int(os.environ.get("REFLECTION_LOOKBACK_DAYS", "14"))
-MIN_TRADES_PER_GROUP = int(os.environ.get("REFLECTION_MIN_TRADES", "5"))
+MIN_TRADES_PER_GROUP = int(os.environ.get("REFLECTION_MIN_TRADES", "20"))
 STEP_FRACTION = float(os.environ.get("REFLECTION_STEP_FRACTION", "0.10"))
+
+# Phase-0 guardrails -----------------------------------------------------
+# Hard ranges. Reflection cannot push a param outside these regardless of
+# what its rules suggest. Numbers are sane defaults for a 60s-tick S&R bot;
+# adjust only with intent.
+PARAM_RANGES: dict[str, tuple[float, float]] = {
+    "APPROACH_PCT":         (0.001, 0.01),
+    "STOP_LOSS_PCT":        (0.005, 0.03),
+    "TAKE_PROFIT_PCT":      (0.005, 0.05),
+    "COOLDOWN_MIN":         (30,    360),
+    "CONFLUENCE_SIZE_MULT": (1.0,   2.0),
+    "TRAIL_TRIGGER_PCT":    (0.002, 0.02),
+    "TRAIL_DISTANCE_PCT":   (0.003, 0.025),
+    "CLUSTER_PCT":          (0.001, 0.02),
+    "CONFLUENCE_PCT":       (0.001, 0.02),
+    "MAX_HOLD_HOURS":       (1,     168),
+}
+
+# Anti-runaway: if the same param has been adjusted in the same direction
+# this many times in this window, freeze further changes to it.
+ANTI_RUNAWAY_WINDOW_DAYS = 7
+ANTI_RUNAWAY_SAME_DIR_COUNT = 3
+
+# Revert: applied changes older than this with regressed performance get rolled back.
+REVERT_AGE_DAYS = 7
+REVERT_LOOKBACK_DAYS = 14
+REVERT_MIN_TRADES = 5
 
 
 def db_conn():
@@ -240,7 +267,8 @@ def analyze(trades: pd.DataFrame, signals: pd.DataFrame) -> tuple[str, dict, dic
 def apply_to_env(proposed: dict, env_path: Path) -> dict:
     """Write proposed param changes directly into the .env file.
 
-    No human gate. Returns the dict of keys actually changed.
+    No human gate. Returns {env_key: {"old": ..., "new": ...}} so revert
+    has the original values to restore later.
     """
     if not proposed or not env_path.exists():
         return {}
@@ -267,6 +295,210 @@ def apply_to_env(proposed: dict, env_path: Path) -> dict:
     return applied
 
 
+def _write_env_value(env_path: Path, env_key: str, value) -> None:
+    """Single-key writer used by revert."""
+    if not env_path.exists():
+        return
+    lines = env_path.read_text().splitlines()
+    replaced = False
+    for i, ln in enumerate(lines):
+        if ln.startswith(f"{env_key}="):
+            lines[i] = f"{env_key}={value}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"{env_key}={value}")
+    env_path.write_text("\n".join(lines) + "\n")
+
+
+def clamp_proposal(proposed: dict) -> tuple[dict, list[str]]:
+    """Force every proposed value into its PARAM_RANGES bounds.
+
+    Returns (clamped_dict, notes_list). Notes list contains a string per
+    clamp action so the reflection summary can show what was bounded.
+    """
+    out: dict = {}
+    notes: list[str] = []
+    for k, v in proposed.items():
+        env_k = k.upper()
+        if env_k in PARAM_RANGES:
+            lo, hi = PARAM_RANGES[env_k]
+            try:
+                vf = float(v)
+            except (TypeError, ValueError):
+                out[k] = v
+                continue
+            clamped = max(lo, min(hi, vf))
+            if clamped != vf:
+                notes.append(f"CLAMPED {env_k}: {vf} -> {clamped} (range [{lo}, {hi}])")
+            # Preserve int-ness for things like COOLDOWN_MIN
+            if isinstance(v, int) and not isinstance(v, bool):
+                clamped = int(round(clamped))
+            out[k] = clamped
+        else:
+            out[k] = v
+    return out, notes
+
+
+def frozen_params() -> dict[str, str]:
+    """Find params modified in the same direction ANTI_RUNAWAY_SAME_DIR_COUNT
+    times within ANTI_RUNAWAY_WINDOW_DAYS. Returns {env_key: reason}.
+    """
+    try:
+        with db_conn() as conn:
+            df = pd.read_sql_query(
+                f"""
+                SELECT applied_ts, applied_changes
+                FROM reflections
+                WHERE applied = TRUE
+                  AND applied_ts >= NOW() - INTERVAL '{ANTI_RUNAWAY_WINDOW_DAYS} days'
+                  AND applied_changes IS NOT NULL
+                ORDER BY applied_ts ASC
+                """,
+                conn,
+            )
+    except Exception:
+        return {}
+    history: dict[str, list[int]] = {}  # env_key -> list of +1/-1
+    for _, row in df.iterrows():
+        ac = row["applied_changes"]
+        if isinstance(ac, str):
+            try:
+                ac = json.loads(ac)
+            except Exception:
+                continue
+        if not isinstance(ac, dict):
+            continue
+        for env_key, change in ac.items():
+            try:
+                old = float(change.get("old")) if change.get("old") is not None else None
+                new = float(change.get("new"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if old is None:
+                continue
+            direction = 1 if new > old else -1 if new < old else 0
+            if direction != 0:
+                history.setdefault(env_key, []).append(direction)
+
+    frozen: dict[str, str] = {}
+    for env_key, dirs in history.items():
+        last = dirs[-ANTI_RUNAWAY_SAME_DIR_COUNT:]
+        if len(last) < ANTI_RUNAWAY_SAME_DIR_COUNT:
+            continue
+        if all(d == 1 for d in last) or all(d == -1 for d in last):
+            sign = "increasing" if last[0] == 1 else "decreasing"
+            frozen[env_key] = (
+                f"{sign} for {ANTI_RUNAWAY_SAME_DIR_COUNT} consecutive applied "
+                f"reflections in last {ANTI_RUNAWAY_WINDOW_DAYS}d — frozen"
+            )
+    return frozen
+
+
+def check_reverts(env_path: Path) -> list[dict]:
+    """Revert applied changes older than REVERT_AGE_DAYS whose performance
+    has not improved vs the prior REVERT_LOOKBACK_DAYS window.
+
+    Returns a list of revert actions for inclusion in the reflection summary.
+    """
+    actions: list[dict] = []
+    try:
+        with db_conn() as conn:
+            refs = pd.read_sql_query(
+                f"""
+                SELECT id, applied_ts, applied_changes
+                FROM reflections
+                WHERE applied = TRUE
+                  AND applied_ts < NOW() - INTERVAL '{REVERT_AGE_DAYS} days'
+                  AND applied_ts > NOW() - INTERVAL '21 days'
+                  AND reverted_at IS NULL
+                  AND applied_changes IS NOT NULL
+                ORDER BY applied_ts ASC
+                """,
+                conn,
+            )
+    except Exception as e:
+        logging.warning("check_reverts: db read failed: %s", e)
+        return actions
+
+    for _, ref in refs.iterrows():
+        ac = ref["applied_changes"]
+        if isinstance(ac, str):
+            try:
+                ac = json.loads(ac)
+            except Exception:
+                continue
+        if not isinstance(ac, dict) or not ac:
+            continue
+        applied_ts = ref["applied_ts"]
+        try:
+            with db_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT
+                      AVG(CASE WHEN exit_ts <  %s THEN pnl_pct END) AS before_mean,
+                      COUNT(*) FILTER (WHERE exit_ts <  %s)         AS before_n,
+                      AVG(CASE WHEN exit_ts >= %s THEN pnl_pct END) AS after_mean,
+                      COUNT(*) FILTER (WHERE exit_ts >= %s)         AS after_n
+                    FROM trades
+                    WHERE strategy = 'sr_paper_bot'
+                      AND exit_ts IS NOT NULL
+                      AND exit_ts >= %s - INTERVAL '{REVERT_LOOKBACK_DAYS} days'
+                      AND exit_ts <  %s + INTERVAL '{REVERT_LOOKBACK_DAYS} days'
+                    """,
+                    (applied_ts, applied_ts, applied_ts, applied_ts,
+                     applied_ts, applied_ts),
+                )
+                before_mean, before_n, after_mean, after_n = cur.fetchone()
+        except Exception as e:
+            logging.warning("check_reverts: pnl window query failed: %s", e)
+            continue
+
+        if not (before_n and after_n and
+                before_n >= REVERT_MIN_TRADES and after_n >= REVERT_MIN_TRADES):
+            continue
+
+        before_mean = float(before_mean or 0)
+        after_mean = float(after_mean or 0)
+        # Revert when post-apply mean PnL is strictly worse than pre-apply.
+        # Add a small noise threshold so we don't churn on tiny shifts.
+        if after_mean >= before_mean - 0.001:
+            continue
+
+        reverted: dict = {}
+        for env_key, change in ac.items():
+            if change.get("old") in (None, ""):
+                continue
+            _write_env_value(env_path, env_key, change["old"])
+            reverted[env_key] = change
+
+        if not reverted:
+            continue
+
+        reason = (f"perf regressed: before_mean={before_mean:.4f} "
+                  f"after_mean={after_mean:.4f} (n_before={before_n}, n_after={after_n})")
+        try:
+            with db_conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE reflections SET reverted_at = NOW(), "
+                    "revert_reason = %s WHERE id = %s",
+                    (reason, int(ref["id"])),
+                )
+        except Exception as e:
+            logging.warning("check_reverts: marking reverted failed: %s", e)
+
+        logging.warning("REVERTED reflection #%d — %s", int(ref["id"]), reason)
+        actions.append({
+            "reflection_id": int(ref["id"]),
+            "reverted": reverted,
+            "before_mean": before_mean,
+            "after_mean": after_mean,
+            "n_before": int(before_n),
+            "n_after": int(after_n),
+        })
+    return actions
+
+
 def main() -> dict:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -278,11 +510,73 @@ def main() -> dict:
              len(trades), len(signals), LOOKBACK_DAYS)
 
     summary, proposed, metrics = analyze(trades, signals)
-
-    # Auto-apply proposals to .env (no human gate). Disable by setting
-    # REFLECTION_AUTO_APPLY=false in the env.
-    auto = os.environ.get("REFLECTION_AUTO_APPLY", "true").lower() == "true"
     env_path = Path(os.environ.get("SR_BOT_ENV_PATH", "/app/sr-bot/.env"))
+
+    # Phase-0 gate 1: revert any stale applied changes whose performance regressed.
+    reverts = check_reverts(env_path)
+    if reverts:
+        summary += f"\nREVERTED {len(reverts)} stale change(s): " \
+                   f"{json.dumps([r['reverted'] for r in reverts])}"
+        log.warning("reverted %d stale reflection(s) — see summary", len(reverts))
+
+    # Phase-0 gate 2: clamp proposals to hard parameter ranges.
+    if proposed:
+        proposed, clamp_notes = clamp_proposal(proposed)
+        if clamp_notes:
+            summary += "\n" + "\n".join(clamp_notes)
+
+    # Phase-0 gate 3: anti-runaway freeze. Drop proposed changes for params
+    # that have been moved the same direction too many times recently.
+    frozen = frozen_params() if proposed else {}
+    if frozen:
+        before = dict(proposed)
+        proposed = {k: v for k, v in proposed.items() if k.upper() not in frozen}
+        dropped = {k: before[k] for k in before if k not in proposed}
+        if dropped:
+            summary += f"\nFROZEN (anti-runaway) skipped {len(dropped)}: " + \
+                       "; ".join(f"{k.upper()} — {frozen[k.upper()]}" for k in dropped)
+            log.info("anti-runaway dropped %d proposed changes: %s", len(dropped), dropped)
+
+    # Phase-6 retirement gate: disable sub-strategies with persistently
+    # negative hit rate; re-enable ones that have recovered. Runs every
+    # reflection cycle, regardless of whether a param proposal exists.
+    if os.environ.get("STRATEGY_RETIREMENT_ENABLED", "true").lower() == "true":
+        try:
+            from strategy_health import evaluate_retirement, apply_retirement
+            ret_result = evaluate_retirement()
+            applied_count = apply_retirement(ret_result)
+            if applied_count:
+                summary += f"\nSTRATEGY_RETIREMENT: applied {applied_count} action(s) — " + \
+                           json.dumps([{a['action']: a['name']} for a in ret_result["actions"]])
+            else:
+                summary += f"\nSTRATEGY_RETIREMENT: no actions ({len(ret_result.get('hit_rates_30d', {}))} strategies evaluated)"
+        except Exception as e:
+            log.warning("retirement gate failed: %s", e)
+            summary += f"\nSTRATEGY_RETIREMENT: ERROR — {e}"
+
+    # Phase-2 gate: walk-forward validation. Replay current vs proposed params
+    # on last 30 days; only apply if 30d AND 7d-OOS Sharpe both improve.
+    wf_result: dict = {}
+    if proposed and os.environ.get("REFLECTION_WALKFORWARD_GATE", "true").lower() == "true":
+        try:
+            from walkforward import walk_forward_gate
+            wf_result = walk_forward_gate(proposed)
+            summary += "\nWALKFORWARD: " + json.dumps({
+                k: v for k, v in wf_result.items()
+                if k in ("passed", "reason", "n_trades_curr", "n_trades_prop",
+                         "sharpe_curr_30d", "sharpe_prop_30d",
+                         "sharpe_curr_oos", "sharpe_prop_oos")
+            })
+            if not wf_result.get("passed"):
+                log.warning("walk-forward GATE REJECTED proposal: %s",
+                            wf_result.get("reason"))
+                proposed = {}
+        except Exception as e:
+            log.warning("walk-forward gate failed (proceeding without): %s", e)
+            summary += f"\nWALKFORWARD: ERROR — {e}"
+
+    # Auto-apply (no human gate). Disable by setting REFLECTION_AUTO_APPLY=false.
+    auto = os.environ.get("REFLECTION_AUTO_APPLY", "true").lower() == "true"
     applied: dict = {}
     if auto and proposed:
         applied = apply_to_env(proposed, env_path)
@@ -294,20 +588,22 @@ def main() -> dict:
         cur.execute("""
             INSERT INTO reflections (
                 strategy, lookback_days, n_trades_analyzed, n_signals_analyzed,
-                summary, proposed_changes, metrics, applied, applied_ts
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                summary, proposed_changes, metrics, applied, applied_ts,
+                applied_changes
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """, (
             "sr_paper_bot", LOOKBACK_DAYS, len(trades), len(signals),
             summary, json.dumps(proposed), json.dumps(metrics, default=str),
             bool(applied),
             datetime.now(timezone.utc) if applied else None,
+            json.dumps(applied) if applied else None,
         ))
         ref_id = cur.fetchone()[0]
 
     log.info("reflection #%d saved.", ref_id)
     return {"reflection_id": ref_id, "summary": summary,
-            "proposed": proposed, "applied": applied}
+            "proposed": proposed, "applied": applied, "reverts": reverts}
 
 
 if __name__ == "__main__":

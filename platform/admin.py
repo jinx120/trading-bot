@@ -90,6 +90,46 @@ if page == "Bot":
     c3.metric("Buying Power", f"${float(acct.get('buying_power', 0)):,.2f}")
     c4.metric("Open Positions", len(positions))
 
+    # Phase 1 telemetry: drawdown throttle + portfolio risk
+    with engine().connect() as conn:
+        try:
+            rs = conn.execute(text(
+                "SELECT peak_equity, lockdown, lockdown_reason FROM risk_state WHERE id = 1"
+            )).fetchone()
+        except Exception:
+            rs = None
+        equity_val = float(acct.get("equity", 0) or 0)
+        peak = float(rs.peak_equity) if rs and rs.peak_equity else equity_val
+        dd_pct = (1.0 - equity_val / peak) * 100 if peak > 0 else 0.0
+        slope = float(os.environ.get("DD_THROTTLE_SLOPE", 4.0))
+        floor = float(os.environ.get("DD_THROTTLE_FLOOR", 0.20))
+        size_mult = max(floor, 1.0 - slope * max(0.0, dd_pct / 100))
+        try:
+            r = conn.execute(text("""
+                SELECT
+                  SUM(ABS(entry_price - (metadata->>'sl')::float) * quantity) AS open_dollar_risk
+                FROM trades
+                WHERE strategy = 'sr_paper_bot' AND exit_ts IS NULL
+                  AND (metadata->>'sl') IS NOT NULL
+            """)).fetchone()
+            open_risk = float(r.open_dollar_risk or 0)
+        except Exception:
+            open_risk = 0.0
+        max_port_risk = float(os.environ.get("MAX_PORTFOLIO_RISK_PCT", 0.02))
+        open_risk_pct = (open_risk / equity_val) * 100 if equity_val > 0 else 0.0
+
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Drawdown", f"{dd_pct:.2f}%",
+              help=f"from peak ${peak:,.2f}; lockdown engages at "
+                   f"{float(os.environ.get('MAX_DRAWDOWN_PCT', 0.15))*100:.0f}%")
+    r2.metric("Size throttle", f"{size_mult:.2f}×",
+              help=f"Vol-target sizing × this multiplier (slope={slope}, floor={floor})")
+    r3.metric("Portfolio risk", f"{open_risk_pct:.2f}% / {max_port_risk*100:.0f}%",
+              help=f"Sum of |entry - SL| × qty across open bot trades. "
+                   f"New entries blocked when this is at cap.")
+    if rs and rs.lockdown:
+        st.error(f"⛔ LOCKDOWN: {rs.lockdown_reason} — no new entries until equity recovers")
+
     st.subheader("Open positions (live)")
     if positions:
         st.dataframe(pd.DataFrame([{
@@ -103,6 +143,60 @@ if page == "Bot":
         } for p in positions]), use_container_width=True, hide_index=True)
     else:
         st.info("No open positions.")
+
+    # ---- Ensemble — Phase 4 ----
+    st.subheader("Ensemble (latest composite per symbol)")
+    st.caption(
+        "Composite = weighted sum of sub-strategy scores. |composite| must clear "
+        f"±{float(os.environ.get('ENSEMBLE_ENTRY_THRESHOLD', 0.40)):.2f} for the "
+        "bot to enter. Disagreement → no trade."
+    )
+    with engine().connect() as conn:
+        try:
+            weights_df = pd.read_sql_query(text("""
+                SELECT name, ROUND(weight::numeric, 3) AS weight,
+                       enabled, last_updated
+                FROM strategy_weights ORDER BY name
+            """), conn)
+            st.dataframe(weights_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.info(f"strategy_weights not populated: {e}")
+
+        try:
+            latest_scores = pd.read_sql_query(text("""
+                WITH ranked AS (
+                  SELECT symbol, strategy, score,
+                         ROW_NUMBER() OVER (PARTITION BY symbol, strategy ORDER BY ts DESC) AS rn,
+                         ts
+                  FROM scores
+                  WHERE ts > NOW() - INTERVAL '15 minutes'
+                )
+                SELECT symbol, strategy, ROUND(score::numeric, 3) AS score, ts
+                FROM ranked WHERE rn = 1
+                ORDER BY symbol, strategy
+            """), conn)
+            if not latest_scores.empty:
+                # Pivot to per-symbol row, per-strategy column
+                pivoted = latest_scores.pivot(index="symbol", columns="strategy",
+                                              values="score").fillna(0.0)
+                # Compute composite using current weights
+                weights = dict(zip(weights_df["name"], weights_df["weight"])) \
+                    if not weights_df.empty else {}
+                enabled_set = set(weights_df[weights_df["enabled"]]["name"]) \
+                    if not weights_df.empty else set()
+                composite = sum(
+                    pivoted.get(s, 0) * weights.get(s, 0)
+                    for s in pivoted.columns if s in enabled_set
+                )
+                if isinstance(composite, pd.Series):
+                    pivoted["composite"] = composite.round(3)
+                threshold = float(os.environ.get("ENSEMBLE_ENTRY_THRESHOLD", 0.40))
+                pivoted["entry_eligible"] = pivoted["composite"].abs() >= threshold
+                st.dataframe(pivoted, use_container_width=True)
+            else:
+                st.info("No recent score rows yet — bot needs one tick.")
+        except Exception as e:
+            st.warning(f"score query failed: {e}")
 
     st.subheader("Recent bot trades")
     with engine().connect() as conn:

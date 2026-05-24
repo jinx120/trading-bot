@@ -468,6 +468,22 @@ def recent_stopouts(cooldown_min: int) -> set[str]:
         return set()
 
 
+def log_score(symbol: str, strategy: str, score: float, metadata: Optional[dict] = None) -> None:
+    """Phase 3: persist sub-strategy scores to `scores` table for ensemble
+    analysis. Live bot writes these every tick; ensemble in Phase 4 reads them
+    to compute composite voting weights."""
+    try:
+        with db_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO scores (symbol, strategy, score, metadata) "
+                "VALUES (%s, %s, %s, %s)",
+                (symbol, strategy, float(score),
+                 json.dumps(metadata) if metadata else None),
+            )
+    except Exception as e:
+        logging.debug("log_score failed: %s", e)
+
+
 def log_signal(
     symbol: str,
     sig: Optional["Signal"],
@@ -772,6 +788,11 @@ def tick(alpaca: Alpaca, cfg: dict, dry_run: bool = False) -> None:
 
     on_cooldown = recent_stopouts(int(cfg.get("COOLDOWN_MIN", 60)))
 
+    # Phase 3: fetch daily bars once per tick for trend sub-strategies.
+    # Daily bars are cheap (10 bars per day × 250 days = 2500 per symbol).
+    daily_lookback_days = 365
+    daily_start = end - timedelta(days=daily_lookback_days)
+
     for symbol in symbols:
         is_crypto = "/" in symbol
         if symbol in on_cooldown:
@@ -788,23 +809,105 @@ def tick(alpaca: Alpaca, cfg: dict, dry_run: bool = False) -> None:
             logging.info("%s: no bars returned", symbol)
             continue
 
+        # Phase 4 ensemble: collect scores from every enabled sub-strategy,
+        # combine into a composite vote, decide side + SL/TP from the dominant
+        # contributor. Set ENSEMBLE_MODE=false to fall back to legacy S&R-only.
+        ensemble_mode = os.environ.get("ENSEMBLE_MODE", "true").lower() == "true"
+        ensemble_scores: dict[str, float] = {}
+        ensemble_sr_levels: dict = {}
+        daily_bars = pd.DataFrame()
+        try:
+            from strategies import REGISTRY as _STRAT_REGISTRY
+            daily_bars = (
+                alpaca.crypto_bars(symbol, daily_start, end, timeframe="1Day")
+                if is_crypto else
+                alpaca.stock_bars(symbol, daily_start, end, timeframe="1Day")
+            )
+            for strat_name, mod in _STRAT_REGISTRY.items():
+                try:
+                    if strat_name in ("donchian_trend", "ma_crossover"):
+                        s = mod.score(daily_bars) if not daily_bars.empty else 0.0
+                    else:
+                        # sr_bounce, zscore_revert operate on 1H bars
+                        s = mod.score(bars)
+                    ensemble_scores[strat_name] = float(s)
+                    log_score(symbol, strat_name, s)
+                except Exception as e:
+                    logging.debug("%s/%s score failed: %s", symbol, strat_name, e)
+        except Exception as e:
+            logging.debug("%s: ensemble score loop failed: %s", symbol, e)
+
         try:
             live_px = alpaca.latest_quote_crypto(symbol) if is_crypto else alpaca.latest_quote_stock(symbol)
         except Exception:
             live_px = None
         bar_close = float(bars["close"].iloc[-1])
-        sig = generate_signal(symbol, bars, cfg, live_price=live_px)
-        extras = {
-            "regime": sig.snapshot.get("regime") if sig else None,
-            "adx": sig.snapshot.get("adx") if sig else None,
-            "approach_pct": cfg.get("APPROACH_PCT"),
-            "live_price": live_px,
-        }
-        if sig is None:
-            logging.info("%s: no signal (close=%.4f)", symbol, bar_close)
-            log_signal(symbol, None, bar_close, took_trade=False,
-                       skip_reason="no_signal", extras=extras)
-            continue
+
+        # ----- Ensemble path (Phase 4) -----
+        if ensemble_mode and ensemble_scores:
+            from ensemble import decide, derive_sl_tp
+            decision = decide(ensemble_scores)
+            entry_price = float(live_px) if live_px is not None else bar_close
+            extras = {
+                "ensemble_composite": decision.composite,
+                "ensemble_confidence": decision.confidence,
+                "ensemble_breakdown": decision.breakdown,
+                "dominant": decision.dominant,
+                "live_price": live_px,
+            }
+            if not decision.entered:
+                # Still build a tiny no-signal log so reflection sees the data
+                logging.info(
+                    "%s: ensemble composite=%+.3f conf=%.2f — %s",
+                    symbol, decision.composite, decision.confidence, decision.reason,
+                )
+                log_signal(symbol, None, bar_close, took_trade=False,
+                           skip_reason=f"ensemble:{decision.reason}", extras=extras)
+                continue
+
+            # Need SR levels for SL/TP derivation if SR is dominant
+            sr_sig = generate_signal(symbol, bars, cfg, live_price=live_px)
+            if sr_sig:
+                ensemble_sr_levels = {
+                    "sup_1h": sr_sig.snapshot.get("sup_1h"),
+                    "res_1h": sr_sig.snapshot.get("res_1h"),
+                    "sup_4h": sr_sig.snapshot.get("sup_4h"),
+                    "res_4h": sr_sig.snapshot.get("res_4h"),
+                }
+            sl, tp = derive_sl_tp(
+                decision.dominant, decision.side, entry_price, bars,
+                sr_levels=ensemble_sr_levels or None,
+            )
+            # Build a Signal-compatible object so the rest of the pipeline works
+            sig = Signal(
+                symbol=symbol, side=decision.side, price=entry_price,
+                trigger_level=ensemble_sr_levels.get("sup_1h" if decision.side == "buy" else "res_1h", entry_price) or entry_price,
+                trigger_tf=("1H_sr" if decision.dominant == "sr_bounce" else "ATR"),
+                sl=float(sl), tp=float(tp),
+                notional_mult=1.0,                       # ensemble owns sizing now
+                confluence=False,                        # legacy field, deprecated by composite
+                snapshot={"ensemble": decision.breakdown,
+                          "composite": decision.composite,
+                          "confidence": decision.confidence,
+                          "dominant": decision.dominant},
+            )
+            extras["sl"] = sl
+            extras["tp"] = tp
+
+        # ----- Legacy S&R path (fallback when ENSEMBLE_MODE=false or no scores) -----
+        else:
+            sig = generate_signal(symbol, bars, cfg, live_price=live_px)
+            extras = {
+                "regime": sig.snapshot.get("regime") if sig else None,
+                "adx": sig.snapshot.get("adx") if sig else None,
+                "approach_pct": cfg.get("APPROACH_PCT"),
+                "live_price": live_px,
+            }
+            if sig is None:
+                logging.info("%s: no signal (close=%.4f)", symbol, bar_close)
+                log_signal(symbol, None, bar_close, took_trade=False,
+                           skip_reason="no_signal", extras=extras)
+                continue
 
         normalized = symbol.replace("/", "")
         if normalized in open_symbols or symbol in open_symbols:
@@ -813,14 +916,28 @@ def tick(alpaca: Alpaca, cfg: dict, dry_run: bool = False) -> None:
                        skip_reason="already_in_position", extras=extras)
             continue
 
-        # Dynamic sizing: ATR + recent-performance multipliers on top of base
+        # Vol-targeted sizing: dollar risk per trade is fixed, notional varies
+        # inversely with stop distance. Carver §15.
+        stop_distance_pct = abs(sig.price - sig.sl) / max(1e-9, sig.price)
         notional, breakdown = compute_notional(
-            base_notional=cfg["NOTIONAL_PER_TRADE"],
+            equity=current_equity,
             bars_1h=bars,
+            stop_distance_pct=stop_distance_pct,
             confluence_mult=sig.notional_mult,
+            side=sig.side,
         )
-        sig.notional_mult = breakdown["conf_mult"]  # keep snapshot honest
         extras["sizing"] = breakdown
+
+        if notional <= 0:
+            logging.info(
+                "%s: SKIP — sizing returned $0 (open_risk=%.2f%% remaining=%.2f%% capped=%s)",
+                symbol, breakdown["open_risk_pct_before"] * 100,
+                breakdown["remaining_risk_pct"] * 100,
+                breakdown["capped_by_portfolio"],
+            )
+            log_signal(symbol, sig, bar_close, took_trade=False,
+                       skip_reason="portfolio_risk_cap", extras=extras)
+            continue
 
         # Risk circuit breakers — last check before placing the order
         veto = veto_reason(limits, current_equity, open_positions, notional, symbol)
@@ -834,7 +951,8 @@ def tick(alpaca: Alpaca, cfg: dict, dry_run: bool = False) -> None:
             f"{symbol}: SIGNAL side={sig.side} px={sig.price:.4f} "
             f"trigger={sig.trigger_level:.4f} sl={sig.sl:.4f} tp={sig.tp:.4f} "
             f"confluence={sig.confluence} notional=${notional:.2f} "
-            f"(vol={breakdown['vol_mult']:.2f} perf={breakdown['perf_mult']:.2f})"
+            f"(stop={stop_distance_pct*100:.2f}% dd_mult={breakdown['dd_mult']:.2f} "
+            f"perf={breakdown['perf_mult']:.2f} open_risk={breakdown['open_risk_pct_before']*100:.2f}%)"
         )
         logging.info(msg)
 

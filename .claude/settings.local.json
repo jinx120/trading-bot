@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo docker compose exec -T timescaledb psql -U trader -d trading -c \"ALTER TABLE strategy_status ADD COLUMN IF NOT EXISTS allocator_weight DOUBLE PRECISION NOT NULL DEFAULT 1.0; SELECT column_name, data_type, column_default FROM information_schema.columns WHERE table_name='strategy_status';\")",
+      "Bash(sudo docker compose exec -T timescaledb psql -U trader -d trading -c \"SELECT strategy, enabled, ROUND\\(allocator_weight::numeric, 2\\) AS weight, promoted_run_id, LEFT\\(paused_reason, 70\\) AS paused FROM strategy_status ORDER BY enabled DESC, strategy;\")",
+      "Bash(sudo docker compose exec -T platform python /app/research/promote_zoo.py --apply --strategies atr_breakout_hourly bollinger_reversion_hourly zscore_reversion_hourly --years 2 --test-months 3 --step-months 1)",
+      "Bash(sudo docker compose exec -T timescaledb psql -U trader -d trading -c \"SELECT strategy, enabled, ROUND\\(allocator_weight::numeric, 3\\) AS weight, promoted_run_id FROM strategy_status ORDER BY enabled DESC, strategy;\")",
+      "Bash(sudo docker compose restart admin)",
+      "Bash(curl -sI http://localhost:8501)",
+      "Bash(sudo docker compose exec -T platform python -c ' *)",
+      "Bash(sudo docker compose logs --tail=20 platform)",
+      "Bash(sudo docker compose exec -T timescaledb psql -U trader -d trading -c \"SELECT strategy, enabled, ROUND\\(allocator_weight::numeric, 3\\) AS weight, promoted_run_id, promoted_at::date FROM strategy_status WHERE enabled=TRUE ORDER BY strategy;\")",
+      "Bash(sudo docker compose logs --tail=200 platform)",
+      "Bash(sudo docker compose logs --tail=300 platform)",
+      "Bash(sudo docker compose exec -T timescaledb psql -U trader -d trading -c \"SELECT strategy, enabled, ROUND\\(allocator_weight::numeric, 3\\) AS weight FROM strategy_status ORDER BY enabled DESC, strategy;\")",
+      "Bash(sudo docker compose restart admin platform)",
+      "Bash(sudo docker compose logs --tail=10 admin)",
+      "Bash(sudo docker compose logs --tail=15 platform)",
+      "Bash(sudo docker compose exec -T timescaledb psql -U trader -d trading -c \"ALTER TABLE runner_config ADD COLUMN IF NOT EXISTS max_parallel_strategies INTEGER NOT NULL DEFAULT 0; SELECT * FROM runner_config WHERE id=1;\")"
+    ]
+  }
+}
