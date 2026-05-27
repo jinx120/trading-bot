@@ -19,6 +19,11 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # py < 3.9
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
 sys.path.insert(0, "/app")
 
 import pandas as pd
@@ -30,6 +35,13 @@ from common.db import get_engine
 
 st.set_page_config(page_title="Trading Bot", page_icon="📊", layout="wide")
 
+# All UI timestamps render in Los Angeles time. DB stays UTC.
+LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def now_local_str() -> str:
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
 
 @st.cache_resource
 def engine():
@@ -40,7 +52,7 @@ def engine():
 # Sidebar
 # ---------------------------------------------------------------------------
 st.sidebar.title("Trading Bot")
-st.sidebar.caption(f"UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+st.sidebar.caption(now_local_str())
 page = st.sidebar.radio("Page", ["Bot", "Symbols", "Reflections"])
 
 _alpaca_ok = bool(os.environ.get("ALPACA_API_KEY"))
@@ -132,15 +144,62 @@ if page == "Bot":
 
     st.subheader("Open positions (live)")
     if positions:
-        st.dataframe(pd.DataFrame([{
-            "symbol": p["symbol"],
-            "qty": float(p["qty"]),
-            "avg_entry": float(p["avg_entry_price"]),
-            "market_price": float(p["current_price"]),
-            "market_value": float(p["market_value"]),
-            "unrealized_pnl": float(p["unrealized_pl"]),
-            "unrealized_pct": round(float(p["unrealized_plpc"]) * 100, 2),
-        } for p in positions]), use_container_width=True, hide_index=True)
+        # Pull SL/TP for each open bot-managed position from trades.metadata.
+        # Alpaca position symbols have no slash (BTCUSD), trades use BTC/USD.
+        with engine().connect() as conn:
+            bot_open = conn.execute(text("""
+                SELECT symbol,
+                       (metadata->>'sl')::float AS sl,
+                       (metadata->>'tp')::float AS tp,
+                       entry_ts
+                FROM trades
+                WHERE strategy = 'sr_paper_bot'
+                  AND exit_ts IS NULL
+                  AND (metadata->>'sl') IS NOT NULL
+            """)).fetchall()
+        sltp_by_sym = {r.symbol.replace("/", ""): r for r in bot_open}
+
+        rows = []
+        for p in positions:
+            sym_alp = p["symbol"]
+            cur_px = float(p["current_price"])
+            entry_px = float(p["avg_entry_price"])
+            qty = float(p["qty"])
+            sl_tp = sltp_by_sym.get(sym_alp)
+            sl = float(sl_tp.sl) if sl_tp else None
+            tp = float(sl_tp.tp) if sl_tp else None
+            held_str = "—"
+            if sl_tp and sl_tp.entry_ts:
+                held = datetime.now(timezone.utc) - sl_tp.entry_ts.replace(
+                    tzinfo=timezone.utc) if sl_tp.entry_ts.tzinfo is None else \
+                    datetime.now(timezone.utc) - sl_tp.entry_ts
+                h = int(held.total_seconds() // 3600)
+                m = int((held.total_seconds() % 3600) // 60)
+                held_str = f"{h}h{m:02d}m"
+
+            sl_dist_pct = ((cur_px - sl) / cur_px * 100) if sl else None
+            tp_dist_pct = ((tp - cur_px) / cur_px * 100) if tp else None
+
+            rows.append({
+                "symbol": sym_alp,
+                "qty": round(qty, 6),
+                "entry": round(entry_px, 4),
+                "price": round(cur_px, 4),
+                "SL": "—" if sl is None else round(sl, 4),
+                "TP": "—" if tp is None else round(tp, 4),
+                "→SL %": "—" if sl_dist_pct is None else f"{sl_dist_pct:+.2f}%",
+                "→TP %": "—" if tp_dist_pct is None else f"{tp_dist_pct:+.2f}%",
+                "PnL $": round(float(p["unrealized_pl"]), 2),
+                "PnL %": round(float(p["unrealized_plpc"]) * 100, 2),
+                "held": held_str,
+            })
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption(
+            "**→SL %** = how far price would have to drop (longs) to hit SL · "
+            "**→TP %** = how far price would have to rise to hit TP · "
+            "**—** for SL/TP means a pre-bot position (no bot-managed exits)"
+        )
     else:
         st.info("No open positions.")
 
@@ -218,6 +277,10 @@ if page == "Bot":
     if bot_trades.empty:
         st.info("No bot trades yet.")
     else:
+        # Convert UTC -> LA for display, drop tz for clean rendering
+        for col in ("entry_ts", "exit_ts"):
+            if col in bot_trades and pd.api.types.is_datetime64_any_dtype(bot_trades[col]):
+                bot_trades[col] = bot_trades[col].dt.tz_convert(LOCAL_TZ).dt.strftime("%m-%d %H:%M")
         st.dataframe(bot_trades, use_container_width=True, hide_index=True)
 
     st.subheader("Last 100 signals evaluated")

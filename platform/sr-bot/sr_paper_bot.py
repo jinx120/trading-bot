@@ -601,16 +601,20 @@ def log_signal(
 
 
 def fetch_open_bot_trades() -> list[dict]:
-    """Return open sr_paper_bot trade rows (no exit yet) joined with their sl/tp."""
+    """Return open managed trade rows (no exit yet) joined with their sl/tp.
+
+    Includes both the bot's own trades and manual orders placed from the Trade
+    tab (strategy='manual'); the latter rely on this loop to enforce SL/TP for
+    crypto (Alpaca has no OCO for crypto)."""
     try:
         with db_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, symbol, side, entry_price, quantity, entry_ts,
+                SELECT id, strategy, symbol, side, entry_price, quantity, entry_ts,
                        (metadata->>'sl')::float AS sl,
                        (metadata->>'tp')::float AS tp,
                        (metadata->>'is_crypto')::bool AS is_crypto
                 FROM trades
-                WHERE strategy = 'sr_paper_bot' AND exit_ts IS NULL
+                WHERE strategy IN ('sr_paper_bot', 'manual') AND exit_ts IS NULL
                 ORDER BY entry_ts ASC
             """)
             return list(cur.fetchall())
@@ -675,6 +679,9 @@ def monitor_exits(alpaca: Alpaca, cfg: dict, dry_run: bool = False) -> None:
         sym = t["symbol"]
         alp_sym = sym.replace("/", "")
         sl, tp, side = t["sl"], t["tp"], t["side"]
+        # Manual orders honor only their explicit SL/TP — no trailing stop and no
+        # MAX_HOLD_HOURS force-close, so we don't override the user's levels.
+        is_manual = t.get("strategy") == "manual"
         if sl is None or tp is None:
             # Pre-existing trade without bot-managed levels (e.g. older manual entries).
             # Skip; we won't try to manage exits for trades we didn't create.
@@ -729,7 +736,7 @@ def monitor_exits(alpaca: Alpaca, cfg: dict, dry_run: bool = False) -> None:
             (new_peak - entry) / entry if side == "long"
             else (entry - new_peak) / entry
         )
-        trail_active = in_profit_pct >= trail_trigger
+        trail_active = (not is_manual) and in_profit_pct >= trail_trigger
         trail_hit = False
         if trail_active:
             if side == "long":
@@ -744,7 +751,7 @@ def monitor_exits(alpaca: Alpaca, cfg: dict, dry_run: bool = False) -> None:
         if entry_ts.tzinfo is None:
             entry_ts = entry_ts.replace(tzinfo=timezone.utc)
         held_hours = (now - entry_ts).total_seconds() / 3600.0
-        time_exit = held_hours >= max_hold_hours
+        time_exit = (not is_manual) and held_hours >= max_hold_hours
 
         if not (hit_tp or hit_sl or trail_hit or time_exit):
             continue
@@ -1125,7 +1132,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="single tick then exit")
     parser.add_argument("--dry-run", action="store_true", help="detect signals but don't place orders")
-    parser.add_argument("--env", default="/home/redji/sr-bot/.env")
+    parser.add_argument("--env", default="/app/sr-bot/.env")
     args = parser.parse_args()
 
     # Primary .env: SR_BOT_* user config (Symbols page writes here).

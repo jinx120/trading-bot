@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Numerals always tabular so they don't jitter on update */
+  .tabular { font-variant-numeric: tabular-nums; }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface border border-border rounded-lg;
+  }
+  .card-header {
+    @apply px-4 py-3 border-b border-border flex items-center justify-between;
+  }
+  .card-body {
+    @apply p-4;
+  }
+  .pill {
+    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium tabular;
+  }
+  .pill-pos { @apply pill bg-pos/15 text-pos; }
+  .pill-neg { @apply pill bg-neg/15 text-neg; }
+  .pill-warn { @apply pill bg-warn/15 text-warn; }
+  .pill-muted { @apply pill bg-muted/10 text-muted; }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 px-3 py-1.5 rounded-md
+           text-sm font-medium border border-border bg-surface hover:bg-border/40
+           transition-colors;
+  }
+  .btn-primary { @apply btn bg-accent border-accent text-white hover:bg-accent/90; }
+  .btn-danger  { @apply btn bg-neg border-neg text-white hover:bg-neg/90; }
+  .table-row-hover tbody tr:hover { @apply bg-border/30; }
+}

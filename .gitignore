@@ -21,3 +21,8 @@ platform/research/notebooks/.ipynb_checkpoints/
 # IDE
 .idea/
 .vscode/
+
+# Node / Frontend
+node_modules/
+dist/
+*.local
